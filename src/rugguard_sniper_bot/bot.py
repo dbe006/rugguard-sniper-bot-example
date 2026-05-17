@@ -29,16 +29,27 @@ from typing import Any
 from unittest.mock import patch
 
 from rugguard_sniper_bot.cache import DecisionCache
-from rugguard_sniper_bot.x402_pay import X402PaymentError, paid_post
+from rugguard_sniper_bot.x402_pay import (
+    X402PaymentError,
+    _validate_https_scheme,
+    paid_post,
+)
 
 DEFAULT_API_URL = "https://rugguard.redfleet.fr"
 DEFAULT_CHAIN = "base"
 DEFAULT_POLICY = "balanced"
 
-# Hard session ceiling on RugGuard spend. Caps the worst case where the bot
-# is mis-configured and burns the wallet through /v1/pretrade/check calls.
-# Each call is $0.01 ; default cap of $1 covers 100 candidates per session,
-# more than enough for an educational walk-through.
+# Per-call USDC ceiling. RugGuard's /v1/pretrade/check costs $0.01 today.
+# We cap at $0.02 so a price-doubling surprise (legit or hostile 402)
+# is refused before signing rather than silently doubling the wallet drain.
+# Increase only if you've verified the price increase out-of-band.
+DEFAULT_PER_CALL_MAX_USDC = 0.02
+
+# Hard session ceiling on RugGuard spend, accounted at PER_CALL_MAX (the
+# upper bound). With the default $1 session cap + $0.02 per-call ceiling,
+# the bot makes at most 50 calls per session even if x402 prices double.
+# That's tighter than the v0.1.0 "$0.01 per call" assumption and resilient
+# to price drift.
 DEFAULT_SESSION_SPEND_CAP_USD = 1.0
 
 
@@ -79,12 +90,15 @@ async def evaluate_candidate(
     private_key_hex: str,
     api_url: str,
     cache: DecisionCache | None = None,
+    max_amount_usdc: float = DEFAULT_PER_CALL_MAX_USDC,
 ) -> SniperDecision:
     """Run /v1/pretrade/check on one candidate, map to a SniperDecision.
 
     Cache hits don't pay. Network / payment errors map to
     `recommendation="error"` and `executed_size_usd=0.0` —
-    conservative-by-default."""
+    conservative-by-default. A 402 advertising more than `max_amount_usdc`
+    is refused before signing (defends against price drift and hostile
+    402s)."""
     if cache is not None:
         cached = cache.get(chain, contract)
         if cached is not None:
@@ -93,6 +107,20 @@ async def evaluate_candidate(
             )
 
     url = f"{api_url.rstrip('/')}/v1/pretrade/check"
+
+    # Validate trust root before signing. A plaintext api_url would leak
+    # the trade intent and let a MITM tamper with the recommendation.
+    try:
+        _validate_https_scheme(url)
+    except X402PaymentError as exc:
+        return SniperDecision(
+            chain=chain,
+            contract=contract,
+            intended_trade_usd=intended_trade_usd,
+            recommendation="error",
+            error=f"config_error: {exc}",
+        )
+
     body = {
         "chain": chain,
         "contract": contract,
@@ -101,7 +129,10 @@ async def evaluate_candidate(
     }
     try:
         status, response = await paid_post(
-            url=url, json_body=body, private_key_hex=private_key_hex
+            url=url,
+            json_body=body,
+            private_key_hex=private_key_hex,
+            max_amount_usdc=max_amount_usdc,
         )
     except X402PaymentError as exc:
         return SniperDecision(
@@ -112,12 +143,16 @@ async def evaluate_candidate(
             error=f"payment_failed: {exc}",
         )
     except Exception as exc:
+        # Generic catch-all. We don't echo str(exc) here because a
+        # malformed private key surfaces as ValueError(f"... {key!r}")
+        # in eth_account, which would write the bad key into the
+        # SniperDecision.error field. Surface only the exception class.
         return SniperDecision(
             chain=chain,
             contract=contract,
             intended_trade_usd=intended_trade_usd,
             recommendation="error",
-            error=f"{type(exc).__name__}: {exc}",
+            error=f"{type(exc).__name__}",
         )
 
     if status != 200:
@@ -155,7 +190,27 @@ def execute_buy_mock(decision: SniperDecision) -> None:
     """Stub for the real DEX router call. Replace with your own router
     integration to make it real. Uses the CLAMPED size, not the intended
     size — RugGuard's `max_suggested_exposure_usd` already down-sized for
-    caution / blocked-out for block."""
+    caution / blocked-out for block.
+
+    ⚠ CRITICAL — READ BEFORE GOING LIVE ON MAINNET:
+
+      When you replace this stub with a real router call, you MUST gate
+      the router invocation on `decision.recommendation in ("allow",
+      "caution")`. NEVER call the router for "error" or "block":
+
+        - "error"  = network / payment / config failure ; the bot does
+                     NOT know the verdict ; conservative-by-default
+                     refuses the buy. A buy here is a silent bug.
+        - "block"  = RugGuard explicitly said do not trade ; ignoring
+                     it defeats the entire kit.
+
+      Also use `decision.executed_size_usd` (the clamped size), NOT
+      `decision.intended_trade_usd` — the clamp is the safety property
+      that makes a "caution" verdict useful instead of binary.
+
+      `run_sniper` itself enforces this gate (line below). If you call
+      `execute_buy_mock` from your own code, replicate the gate.
+    """
     badge = {
         "allow": "[BUY  ]",
         "caution": "[BUY*]",  # asterisk = downsized
@@ -182,26 +237,36 @@ async def run_sniper(
     private_key_hex: str,
     api_url: str = DEFAULT_API_URL,
     session_spend_cap_usd: float = DEFAULT_SESSION_SPEND_CAP_USD,
+    per_call_max_usdc: float = DEFAULT_PER_CALL_MAX_USDC,
 ) -> SniperStats:
     """Main bot loop. Pre-trade-checks each candidate, mock-executes
     according to RugGuard's recommendation, aggregates stats. Aborts
-    early if `session_spend_cap_usd` would be breached."""
+    early if the next call's upper-bound (`per_call_max_usdc`) would push
+    the session past `session_spend_cap_usd`.
+
+    Bookkeeping accounts at `per_call_max_usdc` (the upper bound the kit
+    refuses to exceed per call) rather than the actual paid amount. This
+    is intentionally conservative — if RugGuard's price ever drifts up,
+    the cap holds. v0.1.0 used the actual $0.01 price and would silently
+    over-spend on a price bump."""
     cache = DecisionCache(ttl_seconds=300)
     stats = SniperStats()
     print(
         f"Sniper bot: {len(candidates)} candidates on {chain}, "
         f"policy={policy}, intended_size=${intended_trade_usd}, "
-        f"session cap=${session_spend_cap_usd}\n"
+        f"session cap=${session_spend_cap_usd}, "
+        f"per-call max=${per_call_max_usdc:.4f}\n"
     )
 
     for contract in candidates:
-        # Each /v1/pretrade/check costs $0.01 (USDC on Base). Stop the loop
-        # if the next call would breach the session cap. Defensive against
-        # a mistakenly-massive candidate list.
-        if stats.rugguard_spend_usdc + 0.01 > session_spend_cap_usd:
+        # Stop the loop if the next call's worst-case spend would breach
+        # the session cap. Accounting at `per_call_max_usdc` (the kit's
+        # refusal threshold) makes the cap effective even if the server
+        # advertises a higher price than the historical $0.01.
+        if stats.rugguard_spend_usdc + per_call_max_usdc > session_spend_cap_usd:
             print(
                 f"\nSession spend cap reached "
-                f"(${stats.rugguard_spend_usdc:.2f}/${session_spend_cap_usd}). "
+                f"(${stats.rugguard_spend_usdc:.4f}/${session_spend_cap_usd}). "
                 f"Aborting before contract {contract[:10]}..."
             )
             break
@@ -214,9 +279,11 @@ async def run_sniper(
             private_key_hex=private_key_hex,
             api_url=api_url,
             cache=cache,
+            max_amount_usdc=per_call_max_usdc,
         )
         stats.candidates_evaluated += 1
-        stats.rugguard_spend_usdc += 0.01  # bookkeeping only ; real settle is on-chain
+        # Account at the upper bound. Real settled amount is on-chain.
+        stats.rugguard_spend_usdc += per_call_max_usdc
         stats.would_be_buy_total_usd += intended_trade_usd
 
         execute_buy_mock(decision)
@@ -391,6 +458,17 @@ def main(argv: list[str] | None = None) -> int:
     if not candidates:
         print("error: pass --addresses or --addresses-file (or --demo)", file=sys.stderr)
         return 2
+
+    # Runtime banner — the README disclaimer is not visible from a
+    # headless / CI run. Stderr so the operator sees this even when
+    # stdout is piped to a log file.
+    print(
+        "WARNING: rugguard-sniper-bot-example is an EDUCATIONAL kit. "
+        "`execute_buy_mock` is a stub — no on-chain buy is actually "
+        "executed. See the README Safety section before swapping in a "
+        "real router.",
+        file=sys.stderr,
+    )
 
     asyncio.run(
         run_sniper(

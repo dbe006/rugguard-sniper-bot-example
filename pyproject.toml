@@ -1,6 +1,6 @@
 [project]
 name = "rugguard-sniper-bot-example"
-version = "0.1.0"
+version = "0.1.1"
 description = "Educational Base sniper bot demonstrating RugGuard pre-trade safety integration. Not production-grade."
 readme = "README.md"
 license = { text = "MIT" }
