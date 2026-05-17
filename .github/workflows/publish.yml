@@ -52,8 +52,12 @@ jobs:
       - name: Verify build artifacts
         run: |
           ls -la dist/
-          test -f dist/rugguard_sniper_bot-*.whl
-          test -f dist/rugguard_sniper_bot-*.tar.gz
+          # Wheel name matches the PyPI project name (underscores), not
+          # the import module name. Package = `rugguard-sniper-bot-example`
+          # so wheel = `rugguard_sniper_bot_example-*.whl`. The module
+          # name (`rugguard_sniper_bot`) is shorter, by design.
+          test -f dist/rugguard_sniper_bot_example-*.whl
+          test -f dist/rugguard_sniper_bot_example-*.tar.gz
 
       # pypa/gh-action-pypi-publish@release/v1 → cef221092ed1bacb1cc03d23a2d87d1d172e277b
       - name: Publish to PyPI
