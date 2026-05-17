@@ -334,3 +334,63 @@ async def test_run_sniper_session_cap_uses_per_call_max_upper_bound():
     assert stats.candidates_evaluated == 2, (
         f"expected 2 candidates evaluated before cap, got {stats.candidates_evaluated}"
     )
+
+
+# --- v0.1.2: verify=True signature verification path ---
+
+
+@pytest.mark.asyncio
+async def test_verify_true_without_signature_skips_check():
+    """Unsigned deployment: verify=True is a no-op, normal happy path."""
+    response = _canned()
+    response["signature"] = None
+    response["key_fingerprint"] = None
+
+    async def fake(*, url, json_body, **_kw):
+        return 200, response
+
+    with patch("rugguard_sniper_bot.bot.paid_post", new=fake):
+        d = await evaluate_candidate(
+            chain="base",
+            contract="0xABC",
+            intended_trade_usd=100.0,
+            policy="balanced",
+            private_key_hex="0x" + "ab" * 32,
+            api_url="https://rugguard.redfleet.fr",
+            verify=True,
+        )
+    assert d.recommendation == "allow"
+
+
+@pytest.mark.asyncio
+async def test_verify_true_invalid_signature_routes_to_error():
+    """Tampered signature → recommendation="error", NEVER allowed to buy."""
+    response = _canned()
+    response["signature"] = "VEVTVA=="  # garbage
+    response["key_fingerprint"] = "deadbeef"
+
+    async def fake_post(*, url, json_body, **_kw):
+        return 200, response
+
+    async def fake_pubkey(_api_url):
+        import base64
+
+        return base64.b64encode(b"\x00" * 32).decode()
+
+    with (
+        patch("rugguard_sniper_bot.bot.paid_post", new=fake_post),
+        patch("rugguard_sniper_bot.bot._resolve_pubkey_for_verify", new=fake_pubkey),
+    ):
+        d = await evaluate_candidate(
+            chain="base",
+            contract="0xABC",
+            intended_trade_usd=100.0,
+            policy="balanced",
+            private_key_hex="0x" + "ab" * 32,
+            api_url="https://rugguard.redfleet.fr",
+            verify=True,
+        )
+
+    assert d.recommendation == "error"
+    assert d.executed_size_usd == 0.0
+    assert "signature_invalid" in d.error.lower() or "fingerprint" in d.error.lower()

@@ -1,6 +1,6 @@
 [project]
 name = "rugguard-sniper-bot-example"
-version = "0.1.1"
+version = "0.1.2"
 description = "Educational Base sniper bot demonstrating RugGuard pre-trade safety integration. Not production-grade."
 readme = "README.md"
 license = { text = "MIT" }
@@ -46,6 +46,10 @@ dev = [
     "pytest-asyncio>=0.24,<2.0",
     "ruff>=0.6,<1.0",
 ]
+# In-band Ed25519 signature verification on /v1/pretrade/check responses.
+# Opt-in via --verify CLI flag or `evaluate_candidate(..., verify=True)`.
+# Install: pip install "rugguard-sniper-bot-example[verify]"
+verify = ["rugguard-verify>=0.1.1,<1.0"]
 
 [project.urls]
 Homepage = "https://rugguard.redfleet.fr"

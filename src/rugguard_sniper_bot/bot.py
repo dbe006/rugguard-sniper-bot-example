@@ -91,6 +91,7 @@ async def evaluate_candidate(
     api_url: str,
     cache: DecisionCache | None = None,
     max_amount_usdc: float = DEFAULT_PER_CALL_MAX_USDC,
+    verify: bool = False,
 ) -> SniperDecision:
     """Run /v1/pretrade/check on one candidate, map to a SniperDecision.
 
@@ -164,9 +165,67 @@ async def evaluate_candidate(
             error=f"non_200 status={status}",
         )
 
+    # In-band Ed25519 signature verification (opt-in via verify=True).
+    # Requires `pip install rugguard-sniper-bot-example[verify]`.
+    # On verify failure → recommendation="error" (conservative-by-default,
+    # NEVER lets the bot proceed on a tampered/unverifiable response).
+    if verify and response.get("signature") is not None:
+        try:
+            from rugguard_verify import verify_signed_report
+        except ImportError:
+            return SniperDecision(
+                chain=chain,
+                contract=contract,
+                intended_trade_usd=intended_trade_usd,
+                recommendation="error",
+                error=(
+                    "config_error: verify=True needs rugguard-verify. "
+                    "Install: pip install rugguard-sniper-bot-example[verify]"
+                ),
+            )
+        pubkey = await _resolve_pubkey_for_verify(api_url)
+        if pubkey is None:
+            return SniperDecision(
+                chain=chain,
+                contract=contract,
+                intended_trade_usd=intended_trade_usd,
+                recommendation="error",
+                error="signature_unverifiable: could not fetch /v1/pubkey",
+            )
+        check = verify_signed_report(response, pubkey)
+        if not check.valid:
+            return SniperDecision(
+                chain=chain,
+                contract=contract,
+                intended_trade_usd=intended_trade_usd,
+                recommendation="error",
+                error=f"signature_invalid: {check.reason}",
+            )
+
     if cache is not None:
         cache.put(chain, contract, response)
     return _decision_from_response(chain, contract, intended_trade_usd, response)
+
+
+async def _resolve_pubkey_for_verify(api_url: str) -> str | None:
+    """Fetch /v1/pubkey and return the active pubkey_base64, or None on
+    any failure. Soft-fail by design — caller routes a None to
+    recommendation="error" so the bot never proceeds on an
+    unverifiable response."""
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{api_url.rstrip('/')}/v1/pubkey")
+        if resp.status_code != 200:
+            return None
+        body = resp.json()
+        if body.get("status") != "active":
+            return None
+        pubkey = body.get("pubkey_base64")
+        return pubkey if isinstance(pubkey, str) and pubkey else None
+    except Exception:
+        return None
 
 
 def _decision_from_response(
@@ -238,6 +297,7 @@ async def run_sniper(
     api_url: str = DEFAULT_API_URL,
     session_spend_cap_usd: float = DEFAULT_SESSION_SPEND_CAP_USD,
     per_call_max_usdc: float = DEFAULT_PER_CALL_MAX_USDC,
+    verify: bool = False,
 ) -> SniperStats:
     """Main bot loop. Pre-trade-checks each candidate, mock-executes
     according to RugGuard's recommendation, aggregates stats. Aborts
@@ -280,6 +340,7 @@ async def run_sniper(
             api_url=api_url,
             cache=cache,
             max_amount_usdc=per_call_max_usdc,
+            verify=verify,
         )
         stats.candidates_evaluated += 1
         # Account at the upper bound. Real settled amount is on-chain.
@@ -439,6 +500,16 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_SESSION_SPEND_CAP_USD,
         help=f"Max USDC spent on RugGuard per run (default: ${DEFAULT_SESSION_SPEND_CAP_USD}).",
     )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help=(
+            "Ed25519-verify each signed response in-band before trusting "
+            "it. Requires `pip install rugguard-sniper-bot-example[verify]`. "
+            "Conservative-by-default: a verification failure routes the "
+            "candidate to recommendation=error (no buy)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.demo or (not args.addresses and not args.addresses_file):
@@ -478,6 +549,7 @@ def main(argv: list[str] | None = None) -> int:
             policy=args.policy,
             private_key_hex=pk,
             session_spend_cap_usd=args.session_cap,
+            verify=args.verify,
         )
     )
     return 0
