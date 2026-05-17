@@ -394,3 +394,145 @@ async def test_verify_true_invalid_signature_routes_to_error():
     assert d.recommendation == "error"
     assert d.executed_size_usd == 0.0
     assert "signature_invalid" in d.error.lower() or "fingerprint" in d.error.lower()
+
+
+# --- v0.1.3 hardening: private key format + addresses-file caps ---
+
+
+def test_validate_private_key_accepts_canonical_forms():
+    """Both 64-char bare hex and 0x-prefixed 66-char hex pass validation."""
+    from rugguard_sniper_bot.bot import _validate_private_key_format
+
+    _validate_private_key_format("ab" * 32)  # bare
+    _validate_private_key_format("0x" + "ab" * 32)  # 0x-prefixed
+    _validate_private_key_format("0x" + "AB" * 32)  # mixed case
+
+
+def test_validate_private_key_rejects_garbage():
+    """Reject everything not matching the expected shape; never embed
+    the bad value in the error message (defends against leaking secrets
+    or partial secrets into logs)."""
+    from rugguard_sniper_bot.bot import _validate_private_key_format
+
+    bad_inputs = [
+        "",
+        "deadbeef",  # too short
+        "ab" * 33,  # too long
+        "0x" + "ab" * 31,  # 0x + 62 chars
+        "zz" * 32,  # non-hex
+        "ab" * 31 + "ZZ",  # ends non-hex
+        None,
+    ]
+    for bad in bad_inputs:
+        with pytest.raises(ValueError) as excinfo:
+            _validate_private_key_format(bad)  # type: ignore[arg-type]
+        # Verify the bad input never appears in the error text.
+        if isinstance(bad, str) and bad:
+            assert bad not in str(excinfo.value)
+
+
+def test_load_addresses_rejects_oversize_file(tmp_path):
+    """A 2 MB candidate file is refused before any line is parsed."""
+    import argparse
+
+    from rugguard_sniper_bot.bot import (
+        MAX_ADDRESSES_FILE_BYTES,
+        AddressesFileError,
+        _load_addresses,
+    )
+
+    p = tmp_path / "huge.txt"
+    # Write ~1.5 MB of "a"s in one blob — line-count is irrelevant; this
+    # test exists specifically to verify the byte-size guard short-circuits
+    # before any read.
+    p.write_text("a" * (MAX_ADDRESSES_FILE_BYTES + 512_000))
+    # Ensure the test setup actually overshoots the cap.
+    assert p.stat().st_size > MAX_ADDRESSES_FILE_BYTES
+
+    args = argparse.Namespace(addresses=None, addresses_file=str(p))
+    with pytest.raises(AddressesFileError) as excinfo:
+        _load_addresses(args)
+    assert "max allowed" in str(excinfo.value)
+
+
+def test_load_addresses_rejects_too_many_lines(tmp_path):
+    """A file with >MAX_ADDRESSES_LINES rows is refused after counting."""
+    import argparse
+
+    from rugguard_sniper_bot.bot import (
+        MAX_ADDRESSES_LINES,
+        AddressesFileError,
+        _load_addresses,
+    )
+
+    p = tmp_path / "many.txt"
+    # Keep each line short so total size is under MAX_ADDRESSES_FILE_BYTES
+    # and the failure is specifically the line-count cap.
+    p.write_text(("0x" + "a" * 40 + "\n") * (MAX_ADDRESSES_LINES + 5))
+    args = argparse.Namespace(addresses=None, addresses_file=str(p))
+    with pytest.raises(AddressesFileError) as excinfo:
+        _load_addresses(args)
+    assert str(MAX_ADDRESSES_LINES) in str(excinfo.value)
+
+
+def test_load_addresses_rejects_overlong_line(tmp_path):
+    """A single 500-char line is refused — the file is clearly not a
+    candidate list."""
+    import argparse
+
+    from rugguard_sniper_bot.bot import AddressesFileError, _load_addresses
+
+    p = tmp_path / "bad.txt"
+    p.write_text("0x" + "a" * 500 + "\n")
+    args = argparse.Namespace(addresses=None, addresses_file=str(p))
+    with pytest.raises(AddressesFileError) as excinfo:
+        _load_addresses(args)
+    assert "is not a list of token addresses" in str(excinfo.value)
+
+
+def test_load_addresses_rejects_missing_path(tmp_path):
+    """Nonexistent path → AddressesFileError (not bare FileNotFoundError)."""
+    import argparse
+
+    from rugguard_sniper_bot.bot import AddressesFileError, _load_addresses
+
+    missing = tmp_path / "does-not-exist.txt"
+    args = argparse.Namespace(addresses=None, addresses_file=str(missing))
+    with pytest.raises(AddressesFileError) as excinfo:
+        _load_addresses(args)
+    assert "does not exist" in str(excinfo.value)
+
+
+def test_load_addresses_rejects_directory(tmp_path):
+    """A directory path is refused (caller probably meant a file inside)."""
+    import argparse
+
+    from rugguard_sniper_bot.bot import AddressesFileError, _load_addresses
+
+    args = argparse.Namespace(addresses=None, addresses_file=str(tmp_path))
+    with pytest.raises(AddressesFileError) as excinfo:
+        _load_addresses(args)
+    assert "not a regular file" in str(excinfo.value)
+
+
+def test_load_addresses_accepts_normal_file(tmp_path):
+    """Sanity check: a well-formed small file parses correctly with
+    comments and blank lines stripped."""
+    import argparse
+
+    from rugguard_sniper_bot.bot import _load_addresses
+
+    p = tmp_path / "good.txt"
+    p.write_text(
+        "# header comment\n"
+        "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913\n"
+        "\n"
+        "  0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed  \n"
+        "# trailing comment\n"
+    )
+    args = argparse.Namespace(addresses=None, addresses_file=str(p))
+    addrs = _load_addresses(args)
+    assert addrs == [
+        "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        "0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed",
+    ]

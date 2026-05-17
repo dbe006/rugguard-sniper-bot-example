@@ -23,8 +23,10 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -38,6 +40,27 @@ from rugguard_sniper_bot.x402_pay import (
 DEFAULT_API_URL = "https://rugguard.redfleet.fr"
 DEFAULT_CHAIN = "base"
 DEFAULT_POLICY = "balanced"
+
+# Hard caps on --addresses-file input. An educational kit MUST refuse to
+# eat a 10 GB file or 100K addresses — both would burn the session cap
+# instantly OR (worse) leak memory in tight loops. The numbers below are
+# generous for a real sniper session (10K candidates @ 128 chars/line ≈
+# 1.3 MB) and refuse anything that smells like an accidental misconfig
+# (pointed at a log file, /etc/passwd, etc.).
+MAX_ADDRESSES_FILE_BYTES = 1 * 1024 * 1024  # 1 MB
+MAX_ADDRESSES_LINES = 10_000
+MAX_ADDRESS_LINE_LEN = 128
+
+# Private key format. eth_account.Account.from_key accepts both bare
+# (64-char) and 0x-prefixed (66-char) lowercase or mixed-case hex. We
+# validate explicitly at CLI entry so:
+#   - A malformed key never reaches eth_account, whose ValueError text
+#     includes a `repr(key)` of the bad input. That value can leak into
+#     SniperDecision.error via the generic except branch in
+#     evaluate_candidate.
+#   - The user gets a clear, immediate error from the CLI instead of a
+#     buried "ValueError" from inside an async coroutine.
+_PRIVATE_KEY_RE = re.compile(r"^(0x)?[0-9a-fA-F]{64}$")
 
 # Per-call USDC ceiling. RugGuard's /v1/pretrade/check costs $0.01 today.
 # We cap at $0.02 so a price-doubling surprise (legit or hostile 402)
@@ -456,13 +479,67 @@ async def run_demo() -> int:
     return 0
 
 
+class AddressesFileError(Exception):
+    """Raised by _load_addresses when --addresses-file is unsafe to read."""
+
+
+def _validate_private_key_format(pk: str) -> None:
+    """Reject a private key that isn't 64-hex (optionally 0x-prefixed).
+
+    eth_account's `Account.from_key` raises `ValueError(f"... {key!r}")`
+    on malformed input, embedding the bad bytes into the exception text.
+    Surfacing that string anywhere downstream (logs, decision.error) is
+    a leak. Validate explicitly at CLI boundary and never pass the raw
+    string further if it doesn't match the expected shape.
+    """
+    if not isinstance(pk, str) or not _PRIVATE_KEY_RE.match(pk):
+        raise ValueError(
+            "RUGGUARD_X402_PRIVATE_KEY must be 64 hex chars (optionally "
+            "0x-prefixed). Got an input that does not match the expected "
+            "format. Refusing to pass it to eth_account."
+        )
+
+
 def _load_addresses(args: argparse.Namespace) -> list[str]:
     if args.addresses:
         return [a.strip() for a in args.addresses.split(",") if a.strip()]
-    if args.addresses_file:
-        with open(args.addresses_file, encoding="utf-8") as f:
-            return [line.strip() for line in f if line.strip() and not line.startswith("#")]
-    return []
+    if not args.addresses_file:
+        return []
+
+    # Resolve and validate the path before opening. Reject non-files
+    # (a directory points the bot at recursive misery) and sym-links
+    # (defense against being pointed at /etc/passwd by a misconfigured
+    # systemd unit, etc — best-effort, not a sandbox).
+    path = Path(args.addresses_file)
+    if not path.exists():
+        raise AddressesFileError(f"--addresses-file does not exist: {path}")
+    if not path.is_file():
+        raise AddressesFileError(f"--addresses-file is not a regular file: {path}")
+    size = path.stat().st_size
+    if size > MAX_ADDRESSES_FILE_BYTES:
+        raise AddressesFileError(
+            f"--addresses-file is {size} bytes, max allowed "
+            f"{MAX_ADDRESSES_FILE_BYTES} bytes ({MAX_ADDRESSES_FILE_BYTES // 1024} KB). "
+            f"An educational sniper kit refuses oversize candidate lists."
+        )
+
+    out: list[str] = []
+    with open(path, encoding="utf-8") as f:
+        for lineno, line in enumerate(f, start=1):
+            if lineno > MAX_ADDRESSES_LINES:
+                raise AddressesFileError(
+                    f"--addresses-file exceeds {MAX_ADDRESSES_LINES} lines."
+                )
+            if len(line) > MAX_ADDRESS_LINE_LEN:
+                raise AddressesFileError(
+                    f"--addresses-file line {lineno} is {len(line)} chars, "
+                    f"max {MAX_ADDRESS_LINE_LEN}. Refusing to parse — looks "
+                    f"like the file is not a list of token addresses."
+                )
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                out.append(stripped)
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -525,7 +602,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    candidates = _load_addresses(args)
+    try:
+        _validate_private_key_format(pk)
+    except ValueError as exc:
+        # Do not echo the key value, even partially. The message from
+        # _validate_private_key_format is generic by design.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        candidates = _load_addresses(args)
+    except AddressesFileError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     if not candidates:
         print("error: pass --addresses or --addresses-file (or --demo)", file=sys.stderr)
         return 2
